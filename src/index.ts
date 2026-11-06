@@ -48,6 +48,28 @@ function base64ToUint8Array(base64: string): Uint8Array {
   return bytes;
 }
 
+// Edge isolate rate-limit map: protects Durable Objects from bot spam on the same phone
+// while allowing 1,000+ concurrent guests on the same venue Wi-Fi IP without false positives.
+const edgePhoneBuckets = new Map<string, { count: number; resetAt: number }>();
+
+function allowEdgePhoneRequest(slug: string, rawPhone: string, maxPerMin = 20): boolean {
+  const key = `${slug}:${rawPhone.replace(/\D+/g, "").slice(-10)}`;
+  if (key.endsWith(":")) return true;
+  const now = Date.now();
+  if (edgePhoneBuckets.size > 5000) edgePhoneBuckets.clear();
+  const entry = edgePhoneBuckets.get(key);
+  if (!entry || now > entry.resetAt) {
+    edgePhoneBuckets.set(key, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+  entry.count += 1;
+  return entry.count <= maxPerMin;
+}
+
+function buildPublicEventCacheKey(origin: string, slug: string): Request {
+  return new Request(`${origin}/api/events/${slug}/public`, { method: "GET" });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -66,15 +88,27 @@ export default {
         const action = publicEventMatch[2].toLowerCase();
         const eventStub = env.EVENT_DO.getByName(slug);
 
-        // 1. GET /api/events/:slug/public
+        // 1. GET /api/events/:slug/public (Cached at Cloudflare Edge PoP + purged on Admin save)
         if (action === "public" && request.method === "GET") {
+          const cache = caches.default;
+          const cacheKey = buildPublicEventCacheKey(url.origin, slug);
+          const cached = await cache.match(cacheKey);
+          if (cached) {
+            const hit = new Response(cached.body, cached);
+            hit.headers.set("x-cf-edge-cache", "HIT");
+            return hit;
+          }
+
           const meta = await withDoRetry(() => eventStub.getPublicMeta());
           if (!meta) {
             return jsonResponse({ ok: false, error: "Sự kiện không tồn tại." }, 404);
           }
-          return jsonResponse({ ok: true, event: meta }, 200, {
-            "cache-control": "public, max-age=5",
+          const response = jsonResponse({ ok: true, event: meta }, 200, {
+            "cache-control": "public, max-age=15, s-maxage=60, stale-while-revalidate=300",
+            "x-cf-edge-cache": "MISS",
           });
+          ctx.waitUntil(cache.put(cacheKey, response.clone()));
+          return response;
         }
 
         // 2. GET /api/events/:slug/media/logo | banner (Edge-cached binary response)
@@ -102,8 +136,13 @@ export default {
           return response;
         }
 
-        // 3. GET /api/events/:slug/qr.svg
+        // 3. GET /api/events/:slug/qr.svg (Cached at Cloudflare Edge PoP)
         if (action === "qr.svg" && request.method === "GET") {
+          const cache = caches.default;
+          const cacheKey = new Request(url.toString(), { method: "GET" });
+          const cached = await cache.match(cacheKey);
+          if (cached) return cached;
+
           const targetUrl = url.searchParams.get("url") || `${url.origin}/e/${slug}`;
           const svg = await QRCode.toString(targetUrl, {
             type: "svg",
@@ -115,13 +154,15 @@ export default {
               light: "#ffffff",
             },
           });
-          return new Response(svg, {
+          const response = new Response(svg, {
             status: 200,
             headers: {
               "content-type": "image/svg+xml; charset=utf-8",
-              "cache-control": "public, max-age=3600",
+              "cache-control": "public, max-age=86400, s-maxage=604800",
             },
           });
+          ctx.waitUntil(cache.put(cacheKey, response.clone()));
+          return response;
         }
 
         // 4. GET /api/events/:slug/lookup?phone=...
@@ -138,6 +179,17 @@ export default {
             dayKey?: string;
             walkinName?: string;
           };
+          const rawPhone = String(body.phone ?? "");
+          if (!allowEdgePhoneRequest(slug, rawPhone, 20)) {
+            return jsonResponse(
+              {
+                ok: false,
+                status: "ERROR",
+                message: "Bạn thao tác quá nhanh. Vui lòng đợi ít giây rồi thử lại.",
+              },
+              429
+            );
+          }
           const result = await withDoRetry(() =>
             eventStub.checkin({
               phone: String(body.phone ?? ""),
@@ -316,6 +368,7 @@ export default {
         });
 
         await registryStub.upsertEvent(savedMeta);
+        ctx.waitUntil(caches.default.delete(buildPublicEventCacheKey(url.origin, slug)));
         return jsonResponse({ ok: true, event: savedMeta });
       }
 
@@ -334,6 +387,7 @@ export default {
         if (!subAction && request.method === "DELETE") {
           await eventStub.destroyEvent();
           await registryStub.deleteEvent(slug);
+          ctx.waitUntil(caches.default.delete(buildPublicEventCacheKey(url.origin, slug)));
           return jsonResponse({ ok: true });
         }
 
@@ -371,6 +425,7 @@ export default {
           if (result.meta) {
             await registryStub.upsertEvent(result.meta);
           }
+          ctx.waitUntil(caches.default.delete(buildPublicEventCacheKey(url.origin, slug)));
           return jsonResponse({
             ok: true,
             imported: result.imported,
